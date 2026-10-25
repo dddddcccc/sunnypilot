@@ -20,3 +20,8 @@ if [ -z "$AGNOS_VERSION" ]; then
 fi
 
 export STAGING_ROOT="/data/safe_staging"
+
+# 2022 Asia-Pacific Outback (angle-based EyeSight): its ECU versions aren't in the fingerprint list,
+# so force the platform the same way jacobwaller's branch does. A car picked in sunnypilot's
+# vehicle settings (CarPlatformBundle) takes priority over this.
+export FINGERPRINT="SUBARU_CROSSTREK_2025"
