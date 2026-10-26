@@ -35,7 +35,8 @@ WATCH = {
   (0x222, 1): [('EyeSight ES_Status Cruise_Fault', 15, 1), ('EyeSight ES_Status Cruise_Activated', 29, 1)],
   (0x321, 2): [('攝影機原始 ES_DashStatus Cruise_Fault', 48, 1), ('攝影機原始 ES_DashStatus Cruise_On', 49, 1),
                ('攝影機原始 ES_DashStatus LKAS_State_Msg', 20, 3), ('攝影機原始 ES_DashStatus Soft_Disable', 24, 1)],
-  (0x322, 2): [('攝影機原始 ES_LKAS_State LKAS_Alert', 32, 5), ('攝影機原始 ES_LKAS_State LKAS_ACTIVE', 17, 1)],
+  (0x322, 2): [('攝影機原始 ES_LKAS_State LKAS_Alert', 32, 5), ('攝影機原始 ES_LKAS_State LKAS_ACTIVE', 17, 1),
+               ('攝影機原始 LKAS按鈕狀態(LKAS_Dash_State)', 18, 2)],
   (0x124, 2): [('攝影機原始 角度請求', 12, 1)],
 }
 # what the C4 itself sends to the car in place of the camera's blocked messages
@@ -83,6 +84,12 @@ for s in segs:
         note(t, 'EPS暫時故障', cs.steerFaultTemporary)
         note(t, 'EPS永久故障', cs.steerFaultPermanent)
         cur['angle'], cur['v'] = cs.steeringAngleDeg, cs.vEgo
+        for be in cs.buttonEvents:
+          if str(be.type) == 'lkas':
+            note(t, 'sunnypilot收到LKAS按鈕', 'pressed' if be.pressed else 'released')
+      elif w == 'selfdriveStateSP':
+        m = e.selfdriveStateSP.mads
+        note(t, 'sunnypilot MADS狀態', f'{m.state} enabled={m.enabled} active={m.active}')
       elif w == 'selfdriveState':
         ss = e.selfdriveState
         note(t, 'sunnypilot啟用', ss.enabled)
