@@ -11,6 +11,13 @@ segs = sorted((d for d in glob.glob(str(route) + '--*') if glob.glob(d + '/rlog*
 if not segs:
   sys.exit('找不到行車紀錄')
 print('route:', os.path.basename(str(route)), '| 段數:', len(segs))
+import subprocess
+def _git(*a):
+  try:
+    return subprocess.check_output(['git', *a], cwd='/data/openpilot', text=True, stderr=subprocess.DEVNULL).strip()
+  except Exception:
+    return '?'
+print('C4 目前版本: sunnypilot', _git('log', '-1', '--format=%h'), '| opendbc', _git('-C', 'opendbc_repo', 'log', '-1', '--format=%h'))
 
 t0 = None
 last = {}
@@ -18,6 +25,7 @@ lines = []
 sent = {}
 angle = {'req': 0, 'n': 0, 'lo': 0.0, 'hi': 0.0}
 tx_blocked = rx_invalid = None
+cur = {}
 
 # (address, bus): [(label, start bit, width)]  -- bit positions from opendbc's Subaru global DBC
 WATCH = {
@@ -74,6 +82,7 @@ for s in segs:
         note(t, 'ACC啟用', cs.cruiseState.enabled)
         note(t, 'EPS暫時故障', cs.steerFaultTemporary)
         note(t, 'EPS永久故障', cs.steerFaultPermanent)
+        cur['angle'], cur['v'] = cs.steeringAngleDeg, cs.vEgo
       elif w == 'selfdriveState':
         ss = e.selfdriveState
         note(t, 'sunnypilot啟用', ss.enabled)
@@ -84,6 +93,9 @@ for s in segs:
       elif w == 'pandaStates' and len(e.pandaStates):
         ps = e.pandaStates[0]
         note(t, 'panda允許控制', ps.controlsAllowed)
+        note(t, 'panda允許轉向(MADS)', ps.controlsAllowedLateral)
+        note(t, 'panda MADS設定(alternativeExperience)', ps.alternativeExperience)
+        note(t, 'panda接收檢查無效', ps.safetyRxChecksInvalid)
         note(t, 'panda安全模式', f'{ps.safetyModel} param={ps.safetyParam}')
         note(t, '線束狀態', str(ps.harnessStatus))
         note(t, 'panda故障', str(ps.faultStatus))
@@ -118,7 +130,9 @@ for s in segs:
             angle['req'] += req
             if req:
               angle['lo'], angle['hi'] = min(angle['lo'], a), max(angle['hi'], a)
-            note(t, 'C4送出角度請求', req)
+            if last.get('C4送出角度請求') != req:
+              note(t, 'C4送出角度請求', f"{req} (指令 {a:.2f}° / 方向盤實際 {cur.get('angle', float('nan')):.2f}° / 車速 {cur.get('v', float('nan')) * 3.6:.1f} km/h)")
+              last['C4送出角度請求'] = req
     except Exception as ex:
       note(t, '解析錯誤', f'{w}: {ex}')
 
