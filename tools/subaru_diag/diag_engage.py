@@ -3,28 +3,53 @@ import zstandard
 from openpilot.cereal import log
 
 ROOT = '/data/media/0/realdata'
-routes = sorted({d.rsplit('--', 1)[0] for d in glob.glob(ROOT + '/*--*--*')}, key=lambda r: os.path.getmtime(r + '--0') if os.path.exists(r + '--0') else 0, reverse=True)
-idx = int(sys.argv[1]) if len(sys.argv) > 1 else 0
-print('最近幾趟 (0=最新):', ', '.join(f'{i}={os.path.basename(r)}' for i, r in enumerate(routes[:4])))
+import datetime, subprocess as _sp
+def _seg_dirs(r):
+  return [d for d in glob.glob(r + '--*') if os.path.isdir(d) and d.rsplit('--', 1)[1].isdigit()]
+def _route_start(r):
+  ds = _seg_dirs(r)
+  return min(os.path.getmtime(d) for d in ds) if ds else 0
+# newest first, by the earliest segment that still exists (a route may be missing segment 0)
+routes = sorted({d.rsplit('--', 1)[0] for d in glob.glob(ROOT + '/*--*--*')}, key=_route_start, reverse=True)
+def _when(r):
+  ts = _route_start(r)
+  return datetime.datetime.fromtimestamp(ts, datetime.timezone(datetime.timedelta(hours=8))).strftime('%m-%d %H:%M') if ts else '?'
+
+arg = sys.argv[1] if len(sys.argv) > 1 else '0'
+if arg == 'all':
+  print('掃描所有行車紀錄（新到舊）：')
+  for i, r in enumerate(routes):
+    out = _sp.run([sys.executable, __file__, str(i)], capture_output=True, text=True, env={**os.environ, 'SUMMARY': '1'}).stdout.strip().splitlines()
+    print(f'{i:2d}  {_when(r)}  {os.path.basename(r):24s} 段數 {len(_seg_dirs(r)):3d}  ' + (out[-1] if out else '(無法讀取)'))
+  sys.exit(0)
+idx = int(arg) if arg.isdigit() else next((i for i, r in enumerate(routes) if os.path.basename(r) == arg), 0)
+if not os.environ.get('SUMMARY'):
+  print('最近幾趟 (0=最新):', ', '.join(f'{i}={os.path.basename(r)} ({_when(r)})' for i, r in enumerate(routes[:6])))
 route = routes[idx] if idx < len(routes) else None
 segs = sorted((d for d in glob.glob(str(route) + '--*') if glob.glob(d + '/rlog*')), key=lambda d: int(d.rsplit('--', 1)[1]))
 if not segs:
   sys.exit('找不到行車紀錄')
-print('route:', os.path.basename(str(route)), '| 段數:', len(segs))
+if not os.environ.get('SUMMARY'):
+  print('route:', os.path.basename(str(route)), '| 段數:', len(segs))
 import subprocess
 def _git(*a):
   try:
     return subprocess.check_output(['git', *a], cwd='/data/openpilot', text=True, stderr=subprocess.DEVNULL).strip()
   except Exception:
     return '?'
-print('C4 目前版本: sunnypilot', _git('log', '-1', '--format=%h'), '| opendbc', _git('-C', 'opendbc_repo', 'log', '-1', '--format=%h'))
+if not os.environ.get('SUMMARY'):
+  print('C4 目前版本: sunnypilot', _git('log', '-1', '--format=%h'), '| opendbc', _git('-C', 'opendbc_repo', 'log', '-1', '--format=%h'))
 try:
+  if os.environ.get('SUMMARY'):
+    raise SystemError('skip')
   import json
   from panda import Panda
   built = Panda.get_signature_from_firmware('/data/openpilot/panda/board/obj/panda_h7.bin.signed').hex()[:16]
   seen = [str(json.loads(l).get('msg$s', '')) for fn in sorted(glob.glob('/data/log/swaglog.*'))
           for l in open(fn, errors='ignore') if '"pandad"' in l and 'connected, version' in l]
   print('panda 韌體: 編譯出來的', built, '| 最近一次開機 panda 回報:', seen[-1].split('signature ')[-1] if seen else '?')
+except SystemError:
+  pass
 except Exception as ex:
   print('panda 韌體: 無法讀取 (', ex, ')')
 
@@ -197,6 +222,18 @@ def fmt_snap(c):
   f = lambda k, n=1: f"{c[k]:.{n}f}" if isinstance(c.get(k), float) else str(c.get(k, '?'))
   return (f"車速 {c['v'] * 3.6:.1f} km/h | 方向盤 {f('angle')}° | C4指令 {f('cmd', 2)}° (請求={c.get('req', '?')}) | "
           f"駕駛扭力 {f('torque', 0)} (手動轉向={c.get('pressed', '?')}) | ACC啟用={c.get('acc', '?')} | 煞車={c.get('brake', '?')} | 油門={c.get('gas', '?')}") if 'v' in c else '(還沒有車輛狀態)'
+
+clusters_s = []
+for f in faults:
+  if not clusters_s or f[0] - clusters_s[-1][-1][0] > 30:
+    clusters_s.append([f])
+  else:
+    clusters_s[-1].append(f)
+if os.environ.get('SUMMARY'):
+  bad = [a for _, a in alerts if any(k in a for k in ('TAKE CONTROL', 'Fault', 'Unavailable', 'Malfunction'))]
+  desc = '; '.join(f"{c[0][0]:.0f}s {c[0][1]}={c[0][2]}" for c in clusters_s[:3])
+  print(f"長度 {t_last[0] / 60:5.1f} 分 | 故障 {len(clusters_s)} 次" + (f" ({desc})" if desc else '') + (f" | 警示: {bad[0]}" if bad else ''))
+  sys.exit(0)
 
 print(f"\n紀錄讀取：共 {seg_stats['total']} 段，讀到第 {t_last[0]:.1f} 秒" +
       (f" | 未寫完但已讀取: {', '.join(seg_stats['partial'])}" if seg_stats['partial'] else '') +
