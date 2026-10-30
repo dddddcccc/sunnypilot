@@ -18,6 +18,15 @@ def _git(*a):
   except Exception:
     return '?'
 print('C4 目前版本: sunnypilot', _git('log', '-1', '--format=%h'), '| opendbc', _git('-C', 'opendbc_repo', 'log', '-1', '--format=%h'))
+try:
+  import json
+  from panda import Panda
+  built = Panda.get_signature_from_firmware('/data/openpilot/panda/board/obj/panda_h7.bin.signed').hex()[:16]
+  seen = [str(json.loads(l).get('msg$s', '')) for fn in sorted(glob.glob('/data/log/swaglog.*'))
+          for l in open(fn, errors='ignore') if '"pandad"' in l and 'connected, version' in l]
+  print('panda 韌體: 編譯出來的', built, '| 最近一次開機 panda 回報:', seen[-1].split('signature ')[-1] if seen else '?')
+except Exception as ex:
+  print('panda 韌體: 無法讀取 (', ex, ')')
 
 t0 = None
 last = {}
@@ -48,11 +57,32 @@ SENT_WATCH = {
 def to_signed(v, bits):
   return v - (1 << bits) if v >= 1 << (bits - 1) else v
 
+faults = []
+safety_ready_t = None
+
+def is_fault(key, val):
+  if key in ('EPS Steer_Error_1', 'EPS Steer_Error_2', 'EyeSight ES_Distance Cruise_Fault', 'EyeSight ES_Status Cruise_Fault',
+             '攝影機原始 ES_DashStatus Cruise_Fault', 'EPS Steering_Disabled'):
+    return val == 1
+  if key in ('EPS永久故障', 'EPS暫時故障'):
+    return val is True
+  if key == '畫面警示':
+    return any(k in str(val) for k in ('TAKE CONTROL', 'Fault', 'Unavailable', 'Malfunction'))
+  if key.startswith('被safety擋下'):
+    return safety_ready_t is not None and t_now[0] > safety_ready_t + 2
+  if key == 'panda故障':
+    return safety_ready_t is not None and str(val) != 'none'
+  return False
+
+t_now = [0.0]
+
 def note(t, key, val):
   if last.get(key) != val:
     last[key] = val
-    if len(lines) < 600:
-      lines.append(f'{t:8.2f}s  {key}: {val}')
+    lines.append((t, f'{t:8.2f}s  {key}: {val}', key, val))
+    t_now[0] = t
+    if is_fault(key, val):
+      faults.append((t, key, val, dict(cur)))
 
 for s in segs:
   fn = sorted(glob.glob(s + '/rlog*'))[0]
@@ -83,7 +113,8 @@ for s in segs:
         note(t, 'ACC啟用', cs.cruiseState.enabled)
         note(t, 'EPS暫時故障', cs.steerFaultTemporary)
         note(t, 'EPS永久故障', cs.steerFaultPermanent)
-        cur['angle'], cur['v'] = cs.steeringAngleDeg, cs.vEgo
+        cur['angle'], cur['v'], cur['torque'], cur['pressed'] = cs.steeringAngleDeg, cs.vEgo, cs.steeringTorque, cs.steeringPressed
+        cur['acc'], cur['brake'], cur['gas'] = cs.cruiseState.enabled, cs.brakePressed, cs.gasPressed
         for be in cs.buttonEvents:
           if str(be.type) == 'lkas':
             note(t, 'sunnypilot收到LKAS按鈕', 'pressed' if be.pressed else 'released')
@@ -104,6 +135,8 @@ for s in segs:
         note(t, 'panda MADS設定(alternativeExperience)', ps.alternativeExperience)
         note(t, 'panda接收檢查無效', ps.safetyRxChecksInvalid)
         note(t, 'panda安全模式', f'{ps.safetyModel} param={ps.safetyParam}')
+        if safety_ready_t is None and str(ps.safetyModel) == 'subaru':
+          safety_ready_t = t
         note(t, '線束狀態', str(ps.harnessStatus))
         note(t, 'panda故障', str(ps.faultStatus))
         if tx_blocked is not None and ps.safetyTxBlocked > tx_blocked:
@@ -134,6 +167,7 @@ for s in segs:
             req = (d[1] >> 4) & 1
             a = to_signed((int.from_bytes(d, 'little') >> 40) & 0x1FFFF, 17) * -0.01
             angle['n'] += 1
+            cur['cmd'], cur['req'] = a, req
             angle['req'] += req
             if req:
               angle['lo'], angle['hi'] = min(angle['lo'], a), max(angle['hi'], a)
@@ -143,9 +177,44 @@ for s in segs:
     except Exception as ex:
       note(t, '解析錯誤', f'{w}: {ex}')
 
-print('\n=== 時間軸（只列有變化的項目）===')
-print('\n'.join(lines))
-print('\n=== C4 送出的訊息 (ID, bus): 筆數 ===')
+def fmt_snap(c):
+  f = lambda k, n=1: f"{c[k]:.{n}f}" if isinstance(c.get(k), float) else str(c.get(k, '?'))
+  return (f"車速 {c['v'] * 3.6:.1f} km/h | 方向盤 {f('angle')}° | C4指令 {f('cmd', 2)}° (請求={c.get('req', '?')}) | "
+          f"駕駛扭力 {f('torque', 0)} (手動轉向={c.get('pressed', '?')}) | ACC啟用={c.get('acc', '?')} | 煞車={c.get('brake', '?')} | 油門={c.get('gas', '?')}") if 'v' in c else '(還沒有車輛狀態)'
+
+print('\n=== 基本設定 ===')
+for t, l, _, _ in lines:
+  if any(k in l for k in ('車型:', 'panda安全模式: subaru', 'panda MADS設定')):
+    print(l)
+
+clusters = []
+for f in faults:
+  if not clusters or f[0] - clusters[-1][-1][0] > 30:
+    clusters.append([f])
+  else:
+    clusters[-1].append(f)
+
+if not clusters:
+  print('\n沒有偵測到故障。最後 60 筆變化：')
+  print('\n'.join(l for _, l, _, _ in lines[-60:]))
+for i, cl in enumerate(clusters, 1):
+  t_first = cl[0][0]
+  print(f'\n=== 故障 {i}：第 {t_first:.2f} 秒 ===')
+  print('最先出現：', ', '.join(f'{k}={v}' for _, k, v, _ in cl[:4]))
+  print('當下狀態：', fmt_snap(cl[0][3]))
+  before = {}
+  for t, _, k, v in lines:
+    if t < t_first - 20:
+      before[k] = v
+  keep = ('ACC', 'sunnypilot', 'panda允許', 'MADS', 'EPS', 'EyeSight', '車型', '畫面警示')
+  print(f'--- 第 {max(t_first - 20, 0):.0f} 秒時的狀態 ---')
+  print('  ' + ' | '.join(f'{k}={v}' for k, v in before.items() if any(x in k for x in keep)) if before else '  (從開機就開始)')
+  print(f'--- 前 20 秒到後 5 秒的變化 ---')
+  win = [l for t, l, _, _ in lines if t_first - 20 <= t <= t_first + 5]
+  print('\n'.join(win[-150:]))
+
+print('\n=== C4 送出的轉向相關訊息 (ID, bus): 筆數 ===')
 for (a, b), n in sorted(sent.items()):
-  print(f'  {hex(a)} bus{b}: {n}')
-print(f"\n角度指令 0x124: 共 {angle['n']} 筆 | 請求=1 的 {angle['req']} 筆 | 請求時角度範圍 {angle['lo']:.2f} ~ {angle['hi']:.2f} 度")
+  if a in (0x124, 0x221, 0x321, 0x322, 0x323):
+    print(f'  {hex(a)} bus{b}: {n}')
+print(f"角度指令 0x124: 共 {angle['n']} 筆 | 請求=1 的 {angle['req']} 筆 | 請求時角度範圍 {angle['lo']:.2f} ~ {angle['hi']:.2f} 度")
