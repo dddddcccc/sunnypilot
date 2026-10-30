@@ -35,6 +35,9 @@ sent = {}
 angle = {'req': 0, 'n': 0, 'lo': 0.0, 'hi': 0.0}
 tx_blocked = rx_invalid = None
 cur = {}
+seg_stats = {'total': 0, 'partial': [], 'skipped': []}
+t_last = [0.0]
+alerts = []
 
 # (address, bus): [(label, start bit, width)]  -- bit positions from opendbc's Subaru global DBC
 WATCH = {
@@ -42,6 +45,8 @@ WATCH = {
   (0x118, 0): [('EPS Steering_Disabled', 63, 1)],
   (0x221, 1): [('EyeSight ES_Distance Cruise_Fault', 15, 1), ('EyeSight ES_Distance Soft_Disable', 34, 1)],
   (0x222, 1): [('EyeSight ES_Status Cruise_Fault', 15, 1), ('EyeSight ES_Status Cruise_Activated', 29, 1)],
+  (0x220, 1): [('EyeSight ES_Brake AEB_Status', 32, 4), ('EyeSight ES_Brake Cruise_Brake_Fault', 37, 1),
+               ('EyeSight ES_Brake Cruise_Brake_Active', 38, 1)],
   (0x321, 2): [('攝影機原始 ES_DashStatus Cruise_Fault', 48, 1), ('攝影機原始 ES_DashStatus Cruise_On', 49, 1),
                ('攝影機原始 ES_DashStatus LKAS_State_Msg', 20, 3), ('攝影機原始 ES_DashStatus Soft_Disable', 24, 1)],
   (0x322, 2): [('攝影機原始 ES_LKAS_State LKAS_Alert', 32, 5), ('攝影機原始 ES_LKAS_State LKAS_ACTIVE', 17, 1),
@@ -61,7 +66,7 @@ faults = []
 safety_ready_t = None
 
 def is_fault(key, val):
-  if key in ('EPS Steer_Error_1', 'EPS Steer_Error_2', 'EyeSight ES_Distance Cruise_Fault', 'EyeSight ES_Status Cruise_Fault',
+  if key in ('EPS Steer_Error_1', 'EPS Steer_Error_2', 'EyeSight ES_Distance Cruise_Fault', 'EyeSight ES_Status Cruise_Fault', 'EyeSight ES_Brake Cruise_Brake_Fault',
              '攝影機原始 ES_DashStatus Cruise_Fault', 'EPS Steering_Disabled'):
     return val == 1
   if key in ('EPS永久故障', 'EPS暫時故障'):
@@ -87,11 +92,17 @@ def note(t, key, val):
 for s in segs:
   fn = sorted(glob.glob(s + '/rlog*'))[0]
   dat = open(fn, 'rb').read()
+  seg_stats['total'] += 1
   if dat[:4] == b'\x28\xb5\x2f\xfd':
     try:
       dat = zstandard.ZstdDecompressor().stream_reader(dat).read()
     except zstandard.ZstdError:
-      continue
+      try:  # segment still being written when power was cut: decode as much as exists
+        dat = zstandard.ZstdDecompressor().decompressobj().decompress(dat)
+        seg_stats['partial'].append(os.path.basename(s))
+      except Exception:
+        seg_stats['skipped'].append(os.path.basename(s))
+        continue
   it = log.Event.read_multiple_bytes(dat)
   while True:
     try:
@@ -104,6 +115,7 @@ for s in segs:
     if t0 is None:
       t0 = e.logMonoTime
     t = (e.logMonoTime - t0) / 1e9
+    t_last[0] = max(t_last[0], t)
     try:
       if w == 'carParams':
         note(t, '車型', f'{e.carParams.carFingerprint} dashcam={e.carParams.dashcamOnly}')
@@ -113,6 +125,7 @@ for s in segs:
         note(t, 'ACC啟用', cs.cruiseState.enabled)
         note(t, 'EPS暫時故障', cs.steerFaultTemporary)
         note(t, 'EPS永久故障', cs.steerFaultPermanent)
+        note(t, '駕駛踩煞車', cs.brakePressed)
         cur['angle'], cur['v'], cur['torque'], cur['pressed'] = cs.steeringAngleDeg, cs.vEgo, cs.steeringTorque, cs.steeringPressed
         cur['acc'], cur['brake'], cur['gas'] = cs.cruiseState.enabled, cs.brakePressed, cs.gasPressed
         for be in cs.buttonEvents:
@@ -125,7 +138,10 @@ for s in segs:
         ss = e.selfdriveState
         note(t, 'sunnypilot啟用', ss.enabled)
         note(t, 'sunnypilot控制中', ss.active)
-        note(t, '畫面警示', f'{ss.alertText1} / {ss.alertText2}'.strip(' /'))
+        txt = f'{ss.alertText1} / {ss.alertText2}'.strip(' /')
+        if txt and last.get('畫面警示') != txt:
+          alerts.append((t, txt))
+        note(t, '畫面警示', txt)
       elif w == 'onroadEvents':
         note(t, '事件', ','.join(sorted(str(ev.name) for ev in e.onroadEvents)) or '(無)')
       elif w == 'pandaStates' and len(e.pandaStates):
@@ -182,6 +198,17 @@ def fmt_snap(c):
   return (f"車速 {c['v'] * 3.6:.1f} km/h | 方向盤 {f('angle')}° | C4指令 {f('cmd', 2)}° (請求={c.get('req', '?')}) | "
           f"駕駛扭力 {f('torque', 0)} (手動轉向={c.get('pressed', '?')}) | ACC啟用={c.get('acc', '?')} | 煞車={c.get('brake', '?')} | 油門={c.get('gas', '?')}") if 'v' in c else '(還沒有車輛狀態)'
 
+print(f"\n紀錄讀取：共 {seg_stats['total']} 段，讀到第 {t_last[0]:.1f} 秒" +
+      (f" | 未寫完但已讀取: {', '.join(seg_stats['partial'])}" if seg_stats['partial'] else '') +
+      (f" | 無法讀取: {', '.join(seg_stats['skipped'])}" if seg_stats['skipped'] else ''))
+
+print('\n=== 整趟出現過的畫面警示 ===')
+print('\n'.join(f'{t:8.2f}s  {a}' for t, a in alerts) or '  (無)')
+
+aeb = [(t, v) for t, _, k, v in lines if k == 'EyeSight ES_Brake AEB_Status']
+print('\n=== EyeSight AEB_Status 變化（前 30 筆）===')
+print('\n'.join(f'{t:8.2f}s  {v}' for t, v in aeb[:30]) or '  (無)')
+
 print('\n=== 基本設定 ===')
 for t, l, _, _ in lines:
   if any(k in l for k in ('車型:', 'panda安全模式: subaru', 'panda MADS設定')):
@@ -212,6 +239,10 @@ for i, cl in enumerate(clusters, 1):
   print(f'--- 前 20 秒到後 5 秒的變化 ---')
   win = [l for t, l, _, _ in lines if t_first - 20 <= t <= t_first + 5]
   print('\n'.join(win[-150:]))
+
+print(f'\n=== 行車最後 90 秒（第 {max(t_last[0] - 90, 0):.0f} 秒之後）的變化 ===')
+end = [l for t, l, k, _ in lines if t >= t_last[0] - 90 and k not in ('事件', 'sunnypilot MADS狀態')]
+print('\n'.join(end[-200:]) or '  (無)')
 
 print('\n=== C4 送出的轉向相關訊息 (ID, bus): 筆數 ===')
 for (a, b), n in sorted(sent.items()):
